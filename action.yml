@@ -1,0 +1,204 @@
+# Installs a prebuilt jrs on a GitHub Actions runner and puts it on PATH:
+#
+#   - uses: actions/setup-java@v6
+#     with: { distribution: temurin, java-version: '21' }
+#   - uses: pwittchen/setup-jrs@v1
+#   - run: jrs test
+#
+# `version` picks the release: `latest` (the default), one such as 0.11.1, or
+# `manifest` for the newest release the project's `project.jrs-version` allows,
+# read from jrs.toml (or `manifest`): "0.10" is the newest 0.10.x, "0.10.1"
+# that release exactly, since a 0.x minor may break; from 1.0, the newest
+# release of the same major version at or above it. The archive is checked
+# against the release's SHA256SUMS. Linux, macOS and Windows, x86_64 and arm64.
+#
+# `cache: true` keeps the dependency cache (JRS_CACHE_DIR) between runs, keyed
+# on the jrs.lock files.
+name: Set up jrs
+description: Install jrs, a fast JVM build tool written in Rust, and optionally cache its dependencies
+author: Piotr Wittchen
+branding:
+  icon: package
+  color: orange
+
+inputs:
+  version:
+    description: "The release to install, such as 0.11.1, `latest`, or `manifest` for the newest release the project's `project.jrs-version` allows."
+    required: false
+    default: latest
+  manifest:
+    description: 'The jrs.toml that `version: manifest` reads, relative to the working directory.'
+    required: false
+    default: jrs.toml
+  cache:
+    description: 'Whether to cache the jrs dependency and build cache between runs.'
+    required: false
+    default: 'false'
+  cache-dependency-path:
+    description: 'The files whose hash keys the cache, as a glob relative to the workspace.'
+    required: false
+    default: '**/jrs.lock'
+
+outputs:
+  version:
+    description: 'The version of jrs installed, as `jrs --version` prints it.'
+    value: ${{ steps.install.outputs.version }}
+  path:
+    description: 'The directory jrs was installed into.'
+    value: ${{ steps.install.outputs.path }}
+  cache-hit:
+    description: 'Whether the cache was restored for the exact key.'
+    value: ${{ steps.cache.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        MANIFEST: ${{ inputs.manifest }}
+        CACHE: ${{ inputs.cache }}
+        RUNNER_OS_NAME: ${{ runner.os }}
+        RUNNER_ARCH_NAME: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+        repo="pwittchen/jrs"
+        VERSION="${VERSION:-latest}"
+        if [ "$VERSION" = manifest ]; then
+          [ -f "$MANIFEST" ] || { echo "::error::$MANIFEST does not exist"; exit 1; }
+          # The key is a plain quoted string in [project]; anything else
+          # fails the step, naming the line.
+          required="$(awk '
+            /^[[:space:]]*\[/ { project = ($0 ~ /^[[:space:]]*\[project\][[:space:]]*(#.*)?$/); next }
+            project && /^[[:space:]]*jrs-version[[:space:]]*=/ {
+              v = $0
+              sub(/^[^=]*=[[:space:]]*/, "", v)
+              sub(/[[:space:]]*(#.*)?$/, "", v)
+              if (v ~ /^"[0-9]+\.[0-9]+(\.[0-9]+)?"$/ || v ~ /^\047[0-9]+\.[0-9]+(\.[0-9]+)?\047$/) {
+                print substr(v, 2, length(v) - 2)
+              } else {
+                print "line " NR ": " $0
+              }
+              exit
+            }' "$MANIFEST")"
+          case "$required" in
+            "") echo "::error file=$MANIFEST::$MANIFEST has no project.jrs-version"; exit 1 ;;
+            "line "*) echo "::error file=$MANIFEST::could not read project.jrs-version, $required"; exit 1 ;;
+          esac
+          VERSION="$(git ls-remote --tags --refs "https://github.com/$repo" 'v*' | sed 's|.*refs/tags/||' |
+            awk -v want="$required" '
+              BEGIN { n = split(want, w, ".") }
+              {
+                t = $0
+                sub(/^v/, "", t)
+                if (t !~ /^[0-9]+\.[0-9]+\.[0-9]+$/) next
+                split(t, v, ".")
+                if (v[1] + 0 != w[1] + 0) next
+                if (w[1] + 0 == 0) {
+                  if (v[2] + 0 != w[2] + 0) next
+                  if (n == 3 && v[3] + 0 != w[3] + 0) next
+                } else {
+                  if (v[2] + 0 < w[2] + 0) next
+                  if (n == 3 && v[2] + 0 == w[2] + 0 && v[3] + 0 < w[3] + 0) next
+                }
+                key = sprintf("%09d%09d%09d", v[1], v[2], v[3])
+                if (key > best) { best = key; found = t }
+              }
+              END { if (found != "") print found }')"
+          if [ -z "$VERSION" ]; then
+            echo "::error file=$MANIFEST::no jrs release satisfies jrs-version = \"$required\""
+            exit 1
+          fi
+          echo "$MANIFEST asks for jrs $required; installing $VERSION"
+        elif [ "$VERSION" = latest ]; then
+          # The latest release redirects to its tag, which names the version,
+          # so a runner that already has it installed keeps it.
+          url="$(curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o /dev/null -w '%{url_effective}' \
+            "https://github.com/$repo/releases/latest")"
+          case "$url" in
+            */releases/tag/v*) VERSION="${url##*/releases/tag/v}" ;;
+            *) echo "::error::could not find the latest jrs release ($url)"; exit 1 ;;
+          esac
+          echo "The latest jrs release is $VERSION"
+        fi
+        VERSION="${VERSION#v}"
+        base="https://github.com/$repo/releases/download/v$VERSION"
+
+        case "$RUNNER_ARCH_NAME" in
+          X64) arch=x86_64 ;;
+          ARM64) arch=aarch64 ;;
+          *) echo "::error::there is no prebuilt jrs for $RUNNER_ARCH_NAME"; exit 1 ;;
+        esac
+        case "$RUNNER_OS_NAME" in
+          Linux) asset="jrs-$arch-unknown-linux-musl.tar.gz"; exe=jrs ;;
+          macOS) asset="jrs-$arch-apple-darwin.tar.gz"; exe=jrs ;;
+          Windows) asset="jrs-$arch-pc-windows-msvc.zip"; exe=jrs.exe ;;
+          *) echo "::error::there is no prebuilt jrs for $RUNNER_OS_NAME"; exit 1 ;;
+        esac
+
+        tools="$RUNNER_TOOL_CACHE"
+        temp="$RUNNER_TEMP"
+        if [ "$RUNNER_OS_NAME" = Windows ]; then
+          tools="$(cygpath -u "$tools")"
+          temp="$(cygpath -u "$temp")"
+        fi
+        dir="$tools/jrs/$VERSION/$arch"
+        if [ -x "$dir/$exe" ]; then
+          echo "jrs $VERSION is already in $dir"
+        else
+          cd "$temp"
+          if ! curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$asset" "$base/$asset"; then
+            echo "::error::could not download $base/$asset (is $VERSION a jrs release?)"
+            exit 1
+          fi
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o SHA256SUMS "$base/SHA256SUMS"
+          expected="$(awk -v f="$asset" '{ n = $2; sub(/^\*/, "", n) } n == f { print $1 }' SHA256SUMS)"
+          if command -v sha256sum >/dev/null; then
+            actual="$(sha256sum "$asset")"
+          else
+            actual="$(shasum -a 256 "$asset")"
+          fi
+          if [ -z "$expected" ] || [ "${actual%% *}" != "$expected" ]; then
+            echo "::error::$asset does not match the release's SHA256SUMS"
+            exit 1
+          fi
+          mkdir -p "$dir"
+          if [ "$RUNNER_OS_NAME" = Windows ]; then
+            # Git Bash's tar is GNU tar, which reads no zip.
+            7z x -y -o"$(cygpath -w "$dir")" "$asset" > /dev/null
+          else
+            tar -xzf "$asset" -C "$dir"
+          fi
+          rm -f "$asset" SHA256SUMS
+        fi
+
+        if [ "$RUNNER_OS_NAME" = Windows ]; then
+          path="$(cygpath -w "$dir")"
+        else
+          path="$dir"
+        fi
+        echo "$path" >> "$GITHUB_PATH"
+        installed="$("$dir/$exe" --version)"
+        echo "version=${installed#jrs }" >> "$GITHUB_OUTPUT"
+        echo "path=$path" >> "$GITHUB_OUTPUT"
+        echo "Installed $installed into $path"
+
+        if [ "$CACHE" = true ]; then
+          # A fixed directory on every platform, so the cache step knows
+          # what to save; one the workflow sets itself wins.
+          cache="${JRS_CACHE_DIR:-$HOME/.cache/jrs}"
+          if [ "$RUNNER_OS_NAME" = Windows ]; then
+            cache="$(cygpath -w "$cache")"
+          fi
+          echo "JRS_CACHE_DIR=$cache" >> "$GITHUB_ENV"
+          echo "cache-dir=$cache" >> "$GITHUB_OUTPUT"
+        fi
+
+    - id: cache
+      if: inputs.cache == 'true'
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.install.outputs.cache-dir }}
+        key: jrs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(inputs.cache-dependency-path) }}
+        restore-keys: jrs-${{ runner.os }}-${{ runner.arch }}-
